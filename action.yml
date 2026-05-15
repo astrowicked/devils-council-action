@@ -8,13 +8,30 @@ inputs:
   artifact:
     description: 'Path to the plan or diff file to review (glob supported, e.g. .planning/**/PLAN.md)'
     required: true
-  model:
-    description: 'Model to use for persona agents (default: claude-sonnet-4-20250514)'
+  provider:
+    description: 'LLM provider: anthropic (direct API) or bedrock (AWS Bedrock)'
     required: false
-    default: 'claude-sonnet-4-20250514'
+    default: 'anthropic'
+  model:
+    description: 'Model to use for persona agents (default: claude-sonnet-4-20250514 for anthropic, us.anthropic.claude-sonnet-4-20250514-v1:0 for bedrock)'
+    required: false
+    default: ''
   anthropic-api-key:
-    description: 'Anthropic API key for running reviews'
-    required: true
+    description: 'Anthropic API key (required when provider=anthropic)'
+    required: false
+    default: ''
+  aws-access-key-id:
+    description: 'AWS access key ID (required when provider=bedrock, unless using OIDC/instance role)'
+    required: false
+    default: ''
+  aws-secret-access-key:
+    description: 'AWS secret access key (required when provider=bedrock, unless using OIDC/instance role)'
+    required: false
+    default: ''
+  aws-region:
+    description: 'AWS region for Bedrock (default: us-east-1)'
+    required: false
+    default: 'us-east-1'
   github-token:
     description: 'GitHub token for posting PR comments (defaults to github.token)'
     required: false
@@ -44,25 +61,57 @@ runs:
   steps:
     - name: Install OpenCode + devils-council plugin
       shell: bash
+      env:
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_AWS_REGION: ${{ inputs.aws-region }}
       run: |
         curl -fsSL https://opencode.ai/install | bash
         mkdir -p .opencode
-        cat > .opencode/opencode.json <<'EOF'
+
+        # Resolve default model based on provider
+        if [ -z "$INPUT_MODEL" ]; then
+          if [ "$INPUT_PROVIDER" = "bedrock" ]; then
+            INPUT_MODEL="us.anthropic.claude-sonnet-4-20250514-v1:0"
+          else
+            INPUT_MODEL="claude-sonnet-4-20250514"
+          fi
+        fi
+
+        # Generate provider config
+        if [ "$INPUT_PROVIDER" = "bedrock" ]; then
+          cat > .opencode/opencode.json <<EOF
         {
           "plugin": ["devils-council-opencode"],
           "provider": {
-            "anthropic": {
-              "model": "${{ inputs.model }}"
+            "amazon-bedrock": {
+              "model": "$INPUT_MODEL",
+              "region": "$INPUT_AWS_REGION"
             }
           }
         }
         EOF
+        else
+          cat > .opencode/opencode.json <<EOF
+        {
+          "plugin": ["devils-council-opencode"],
+          "provider": {
+            "anthropic": {
+              "model": "$INPUT_MODEL"
+            }
+          }
+        }
+        EOF
+        fi
 
     - name: Run council review
       id: review
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+        AWS_REGION: ${{ inputs.aws-region }}
       run: |
         set -euo pipefail
 
