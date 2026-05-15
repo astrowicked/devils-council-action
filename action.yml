@@ -1,0 +1,164 @@
+name: 'Devils Council Review'
+description: 'Adversarial AI review of plans and code — 4 expert personas find what you missed before you ship.'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  artifact:
+    description: 'Path to the plan or diff file to review (glob supported, e.g. .planning/**/PLAN.md)'
+    required: true
+  model:
+    description: 'Model to use for persona agents (default: claude-sonnet-4-20250514)'
+    required: false
+    default: 'claude-sonnet-4-20250514'
+  anthropic-api-key:
+    description: 'Anthropic API key for running reviews'
+    required: true
+  github-token:
+    description: 'GitHub token for posting PR comments (defaults to github.token)'
+    required: false
+    default: ${{ github.token }}
+  severity-threshold:
+    description: 'Minimum severity to include in PR comment (blocker, high, medium, minor)'
+    required: false
+    default: 'high'
+  max-findings:
+    description: 'Maximum findings to show in PR comment (keeps it readable)'
+    required: false
+    default: '15'
+
+outputs:
+  blocker-count:
+    description: 'Number of BLOCKER-severity findings'
+    value: ${{ steps.review.outputs.blocker_count }}
+  high-count:
+    description: 'Number of HIGH-severity findings'
+    value: ${{ steps.review.outputs.high_count }}
+  synthesis-path:
+    description: 'Path to the SYNTHESIS.md output'
+    value: ${{ steps.review.outputs.synthesis_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install OpenCode + devils-council plugin
+      shell: bash
+      run: |
+        curl -fsSL https://opencode.ai/install | bash
+        mkdir -p .opencode
+        cat > .opencode/opencode.json <<'EOF'
+        {
+          "plugin": ["devils-council-opencode"],
+          "provider": {
+            "anthropic": {
+              "model": "${{ inputs.model }}"
+            }
+          }
+        }
+        EOF
+
+    - name: Run council review
+      id: review
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+      run: |
+        set -euo pipefail
+
+        ARTIFACT="${{ inputs.artifact }}"
+
+        # Expand glob if needed
+        shopt -s globstar nullglob
+        FILES=($ARTIFACT)
+        shopt -u globstar nullglob
+
+        if [ ${#FILES[@]} -eq 0 ]; then
+          echo "::warning::No files matched artifact pattern: $ARTIFACT"
+          echo "blocker_count=0" >> "$GITHUB_OUTPUT"
+          echo "high_count=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Reviewing ${#FILES[@]} artifact(s): ${FILES[*]}"
+
+        # Run review on first matching file (v1: single artifact)
+        TARGET="${FILES[0]}"
+        echo "::group::Devils Council Review: $TARGET"
+
+        opencode run "/devils-council:review $TARGET --type=plan" 2>&1 || true
+
+        echo "::endgroup::"
+
+        # Find the latest synthesis
+        SYNTHESIS=$(ls -t .council/*/SYNTHESIS.md 2>/dev/null | head -1 || true)
+        if [ -z "$SYNTHESIS" ]; then
+          echo "::warning::No synthesis produced"
+          echo "blocker_count=0" >> "$GITHUB_OUTPUT"
+          echo "high_count=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "synthesis_path=$SYNTHESIS" >> "$GITHUB_OUTPUT"
+
+        # Count findings by severity
+        BLOCKERS=$(grep -c "BLOCKER" "$SYNTHESIS" 2>/dev/null || echo "0")
+        HIGHS=$(grep -c "HIGH\|High-Severity" "$SYNTHESIS" 2>/dev/null || echo "0")
+        echo "blocker_count=$BLOCKERS" >> "$GITHUB_OUTPUT"
+        echo "high_count=$HIGHS" >> "$GITHUB_OUTPUT"
+
+    - name: Post PR comment
+      if: github.event_name == 'pull_request' && steps.review.outputs.synthesis_path != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SYNTHESIS: ${{ steps.review.outputs.synthesis_path }}
+        BLOCKERS: ${{ steps.review.outputs.blocker_count }}
+        HIGHS: ${{ steps.review.outputs.high_count }}
+        MAX_FINDINGS: ${{ inputs.max-findings }}
+      run: |
+        set -euo pipefail
+
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+
+        # Build comment body
+        ICON="✅"
+        if [ "$BLOCKERS" -gt 0 ]; then
+          ICON="🚫"
+        elif [ "$HIGHS" -gt 0 ]; then
+          ICON="⚠️"
+        fi
+
+        {
+          echo "## ${ICON} Devils Council Review"
+          echo ""
+          echo "| Severity | Count |"
+          echo "|----------|-------|"
+          echo "| Blockers | $BLOCKERS |"
+          echo "| High | $HIGHS |"
+          echo ""
+          echo "<details>"
+          echo "<summary>Full Synthesis (click to expand)</summary>"
+          echo ""
+          # Truncate to keep comment readable
+          head -100 "$SYNTHESIS"
+          echo ""
+          echo "</details>"
+          echo ""
+          echo "---"
+          echo "*Reviewed by [Devils Council](https://github.com/astrowicked/devils-council) — adversarial AI plan review*"
+        } > /tmp/dc-comment.md
+
+        # Post or update comment
+        EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+          --jq '.[] | select(.body | contains("Devils Council Review")) | .id' | head -1 || true)
+
+        if [ -n "$EXISTING" ]; then
+          gh api "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
+            -X PATCH -F "body=@/tmp/dc-comment.md"
+          echo "::notice::Updated existing council review comment"
+        else
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -X POST -F "body=@/tmp/dc-comment.md"
+          echo "::notice::Posted council review comment"
+        fi
