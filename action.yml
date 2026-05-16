@@ -6,8 +6,17 @@ branding:
 
 inputs:
   artifact:
-    description: 'Path to the plan or diff file to review (glob supported, e.g. .planning/**/PLAN.md)'
-    required: true
+    description: 'Path to plan file (glob supported), or "pr-diff" to auto-fetch the PR diff'
+    required: false
+    default: 'pr-diff'
+  type:
+    description: 'Artifact type: auto (detect from content), plan, code-diff, rfc'
+    required: false
+    default: 'auto'
+  post-as:
+    description: 'How to post findings: comment (PR summary), inline-review (line-level review comments), both'
+    required: false
+    default: 'both'
   provider:
     description: 'LLM provider: anthropic (direct API) or bedrock (AWS Bedrock)'
     required: false
@@ -33,28 +42,38 @@ inputs:
     required: false
     default: 'us-east-1'
   github-token:
-    description: 'GitHub token for posting PR comments (defaults to github.token)'
+    description: 'GitHub token for posting PR comments (defaults to github.token). Needs pull-requests: write for inline reviews.'
     required: false
     default: ${{ github.token }}
   severity-threshold:
-    description: 'Minimum severity to include in PR comment (blocker, high, medium, minor)'
+    description: 'Minimum severity to post: blocker, major, minor, nit'
     required: false
-    default: 'high'
+    default: 'major'
   max-findings:
     description: 'Maximum findings to show in PR comment (keeps it readable)'
     required: false
-    default: '15'
+    default: '20'
+  exclude-paths:
+    description: 'Comma-separated file patterns to exclude from code review (e.g. "*.lock,dist/**")'
+    required: false
+    default: '*.lock,package-lock.json,*.min.js,*.min.css'
 
 outputs:
   blocker-count:
     description: 'Number of BLOCKER-severity findings'
     value: ${{ steps.review.outputs.blocker_count }}
-  high-count:
-    description: 'Number of HIGH-severity findings'
-    value: ${{ steps.review.outputs.high_count }}
+  major-count:
+    description: 'Number of MAJOR-severity findings'
+    value: ${{ steps.review.outputs.major_count }}
+  verdict:
+    description: 'Overall verdict: BLOCK, WARN, or PASS'
+    value: ${{ steps.review.outputs.verdict }}
   synthesis-path:
     description: 'Path to the SYNTHESIS.md output'
     value: ${{ steps.review.outputs.synthesis_path }}
+  report-path:
+    description: 'Path to the HTML report (if python3 available)'
+    value: ${{ steps.review.outputs.report_path }}
 
 runs:
   using: 'composite'
@@ -66,10 +85,10 @@ runs:
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_AWS_REGION: ${{ inputs.aws-region }}
       run: |
+        set -euo pipefail
         curl -fsSL https://opencode.ai/install | bash
         mkdir -p .opencode
 
-        # Resolve default model based on provider
         if [ -z "$INPUT_MODEL" ]; then
           if [ "$INPUT_PROVIDER" = "bedrock" ]; then
             INPUT_MODEL="us.anthropic.claude-sonnet-4-20250514-v1:0"
@@ -78,11 +97,10 @@ runs:
           fi
         fi
 
-        # Generate provider config
         if [ "$INPUT_PROVIDER" = "bedrock" ]; then
           cat > .opencode/opencode.json <<EOF
         {
-          "plugin": ["devils-council-opencode"],
+          "plugin": ["devils-council-opencode@latest"],
           "provider": {
             "amazon-bedrock": {
               "model": "$INPUT_MODEL",
@@ -94,7 +112,7 @@ runs:
         else
           cat > .opencode/opencode.json <<EOF
         {
-          "plugin": ["devils-council-opencode"],
+          "plugin": ["devils-council-opencode@latest"],
           "provider": {
             "anthropic": {
               "model": "$INPUT_MODEL"
@@ -104,101 +122,350 @@ runs:
         EOF
         fi
 
+    - name: Resolve artifact
+      id: artifact
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ARTIFACT_INPUT: ${{ inputs.artifact }}
+        TYPE_INPUT: ${{ inputs.type }}
+        EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+      run: |
+        set -euo pipefail
+
+        if [ "$ARTIFACT_INPUT" = "pr-diff" ]; then
+          echo "Fetching PR diff..."
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+            -H "Accept: application/vnd.github.v3.diff" > /tmp/pr.diff
+
+          # Filter excluded paths
+          if [ -n "$EXCLUDE_PATHS" ]; then
+            IFS=',' read -ra EXCLUDES <<< "$EXCLUDE_PATHS"
+            FILTER_ARGS=""
+            for pattern in "${EXCLUDES[@]}"; do
+              FILTER_ARGS="$FILTER_ARGS --exclude=$pattern"
+            done
+            # Use filterdiff if available, otherwise keep full diff
+            if command -v filterdiff &>/dev/null; then
+              filterdiff $FILTER_ARGS /tmp/pr.diff > /tmp/pr-filtered.diff 2>/dev/null || cp /tmp/pr.diff /tmp/pr-filtered.diff
+              mv /tmp/pr-filtered.diff /tmp/pr.diff
+            fi
+          fi
+
+          DIFF_SIZE=$(wc -c < /tmp/pr.diff | tr -d ' ')
+          echo "PR diff: ${DIFF_SIZE} bytes"
+
+          if [ "$DIFF_SIZE" -gt 102400 ]; then
+            echo "::warning::PR diff exceeds 100KB (${DIFF_SIZE} bytes). Truncating to first 100KB."
+            head -c 102400 /tmp/pr.diff > /tmp/pr-truncated.diff
+            mv /tmp/pr-truncated.diff /tmp/pr.diff
+          fi
+
+          echo "target=/tmp/pr.diff" >> "$GITHUB_OUTPUT"
+          echo "type=code-diff" >> "$GITHUB_OUTPUT"
+        else
+          shopt -s globstar nullglob
+          FILES=($ARTIFACT_INPUT)
+          shopt -u globstar nullglob
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::warning::No files matched artifact pattern: $ARTIFACT_INPUT"
+            echo "target=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "target=${FILES[0]}" >> "$GITHUB_OUTPUT"
+          if [ "$TYPE_INPUT" = "auto" ]; then
+            echo "type=plan" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=$TYPE_INPUT" >> "$GITHUB_OUTPUT"
+          fi
+        fi
+
     - name: Run council review
       id: review
+      if: steps.artifact.outputs.target != ''
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
         AWS_REGION: ${{ inputs.aws-region }}
+        TARGET: ${{ steps.artifact.outputs.target }}
+        TYPE: ${{ steps.artifact.outputs.type }}
       run: |
         set -euo pipefail
 
-        ARTIFACT="${{ inputs.artifact }}"
-
-        # Expand glob if needed
-        shopt -s globstar nullglob
-        FILES=($ARTIFACT)
-        shopt -u globstar nullglob
-
-        if [ ${#FILES[@]} -eq 0 ]; then
-          echo "::warning::No files matched artifact pattern: $ARTIFACT"
-          echo "blocker_count=0" >> "$GITHUB_OUTPUT"
-          echo "high_count=0" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        echo "Reviewing ${#FILES[@]} artifact(s): ${FILES[*]}"
-
-        # Run review on first matching file (v1: single artifact)
-        TARGET="${FILES[0]}"
-        echo "::group::Devils Council Review: $TARGET"
-
-        opencode run "/devils-council:review $TARGET --type=plan" 2>&1 || true
-
+        echo "::group::Devils Council Review: $TARGET (type: $TYPE)"
+        opencode run "/devils-council:review $TARGET --type=$TYPE" 2>&1 || true
         echo "::endgroup::"
 
-        # Find the latest synthesis
         SYNTHESIS=$(ls -t .council/*/SYNTHESIS.md 2>/dev/null | head -1 || true)
         if [ -z "$SYNTHESIS" ]; then
           echo "::warning::No synthesis produced"
           echo "blocker_count=0" >> "$GITHUB_OUTPUT"
-          echo "high_count=0" >> "$GITHUB_OUTPUT"
+          echo "major_count=0" >> "$GITHUB_OUTPUT"
+          echo "verdict=PASS" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
         echo "synthesis_path=$SYNTHESIS" >> "$GITHUB_OUTPUT"
+        RUN_DIR=$(dirname "$SYNTHESIS")
 
-        # Count findings by severity
-        BLOCKERS=$(grep -c "BLOCKER" "$SYNTHESIS" 2>/dev/null || echo "0")
-        HIGHS=$(grep -c "HIGH\|High-Severity" "$SYNTHESIS" 2>/dev/null || echo "0")
+        # Generate HTML report
+        RENDER=$(find "$RUN_DIR" -name "REPORT.html" 2>/dev/null | head -1)
+        if [ -z "$RENDER" ] && command -v python3 &>/dev/null; then
+          DC_BIN=$(find ~/.cache/opencode/packages -path "*/devils-council-opencode/bin/dc-render-html.py" 2>/dev/null | head -1)
+          if [ -n "$DC_BIN" ]; then
+            python3 "$DC_BIN" "$RUN_DIR" 2>/dev/null || true
+            RENDER="$RUN_DIR/REPORT.html"
+          fi
+        fi
+        echo "report_path=${RENDER:-}" >> "$GITHUB_OUTPUT"
+
+        # Count findings by severity from scorecard YAML frontmatter
+        BLOCKERS=0
+        MAJORS=0
+        for scorecard in "$RUN_DIR"/*.md; do
+          [ -f "$scorecard" ] || continue
+          case "$(basename "$scorecard")" in INPUT.md|SYNTHESIS.md|MANIFEST*) continue ;; esac
+          BLOCKERS=$((BLOCKERS + $(grep -c 'severity: blocker' "$scorecard" 2>/dev/null || echo 0)))
+          MAJORS=$((MAJORS + $(grep -c 'severity: major' "$scorecard" 2>/dev/null || echo 0)))
+        done
+
         echo "blocker_count=$BLOCKERS" >> "$GITHUB_OUTPUT"
-        echo "high_count=$HIGHS" >> "$GITHUB_OUTPUT"
+        echo "major_count=$MAJORS" >> "$GITHUB_OUTPUT"
 
-    - name: Post PR comment
-      if: github.event_name == 'pull_request' && steps.review.outputs.synthesis_path != ''
+        if [ "$BLOCKERS" -gt 0 ]; then
+          echo "verdict=BLOCK" >> "$GITHUB_OUTPUT"
+        elif [ "$MAJORS" -gt 0 ]; then
+          echo "verdict=WARN" >> "$GITHUB_OUTPUT"
+        else
+          echo "verdict=PASS" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Post inline review comments
+      if: |
+        github.event_name == 'pull_request' &&
+        steps.review.outputs.synthesis_path != '' &&
+        (inputs.post-as == 'inline-review' || inputs.post-as == 'both') &&
+        steps.artifact.outputs.type == 'code-diff'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         SYNTHESIS: ${{ steps.review.outputs.synthesis_path }}
         BLOCKERS: ${{ steps.review.outputs.blocker_count }}
-        HIGHS: ${{ steps.review.outputs.high_count }}
+        VERDICT: ${{ steps.review.outputs.verdict }}
+        SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
         MAX_FINDINGS: ${{ inputs.max-findings }}
       run: |
         set -euo pipefail
 
         PR_NUMBER="${{ github.event.pull_request.number }}"
+        COMMIT_SHA="${{ github.event.pull_request.head.sha }}"
+        RUN_DIR=$(dirname "$SYNTHESIS")
 
-        # Build comment body
-        ICON="✅"
-        if [ "$BLOCKERS" -gt 0 ]; then
-          ICON="🚫"
-        elif [ "$HIGHS" -gt 0 ]; then
-          ICON="⚠️"
+        # Parse findings from scorecards and map to inline review comments
+        # Each finding has: target (file:line or section), claim, severity, persona
+        python3 - "$RUN_DIR" "$SEVERITY_THRESHOLD" "$MAX_FINDINGS" << 'PARSE_SCRIPT'
+        import sys, json, re, os
+        try:
+            import yaml
+        except ImportError:
+            print("::warning::PyYAML not available, falling back to summary comment only")
+            sys.exit(0)
+
+        run_dir = sys.argv[1]
+        threshold = sys.argv[2]
+        max_findings = int(sys.argv[3])
+
+        severity_order = {"blocker": 0, "major": 1, "minor": 2, "nit": 3}
+        threshold_level = severity_order.get(threshold, 1)
+
+        comments = []
+        for md_file in sorted(os.listdir(run_dir)):
+            if not md_file.endswith(".md"):
+                continue
+            if md_file in ("INPUT.md", "SYNTHESIS.md") or md_file.startswith("MANIFEST"):
+                continue
+
+            path = os.path.join(run_dir, md_file)
+            with open(path) as f:
+                content = f.read()
+
+            if not content.startswith("---\n"):
+                continue
+
+            end_idx = content.index("\n---\n", 4)
+            fm = yaml.safe_load(content[4:end_idx])
+            if not fm or "findings" not in fm:
+                continue
+
+            persona = fm.get("persona", md_file.replace(".md", ""))
+
+            for finding in fm["findings"]:
+                sev = finding.get("severity", "nit")
+                if severity_order.get(sev, 3) > threshold_level:
+                    continue
+
+                target = finding.get("target", "")
+                claim = finding.get("claim", "")
+                ask = finding.get("ask", "")
+                fid = finding.get("id", "")
+
+                # Try to extract file:line from target
+                # Patterns: "src/auth.ts:47", "## Section Name", "Task 2"
+                file_match = re.match(r'^([^:]+\.\w+):(\d+)', target)
+
+                body = f"**[{sev.upper()}]** ({persona}) {claim}"
+                if ask:
+                    body += f"\n\n> **Ask:** {ask}"
+                if fid:
+                    body += f"\n\n<sub>Finding: `{fid}`</sub>"
+
+                if file_match:
+                    comments.append({
+                        "path": file_match.group(1),
+                        "line": int(file_match.group(2)),
+                        "body": body,
+                        "severity": sev,
+                    })
+                else:
+                    # Non-file findings go as general comments
+                    comments.append({
+                        "path": None,
+                        "line": None,
+                        "body": body,
+                        "severity": sev,
+                    })
+
+        # Sort by severity, truncate
+        comments.sort(key=lambda c: severity_order.get(c["severity"], 3))
+        comments = comments[:max_findings]
+
+        # Split into inline (have file+line) and general (no file)
+        inline = [c for c in comments if c["path"] and c["line"]]
+        general = [c for c in comments if not c["path"] or not c["line"]]
+
+        output = {"inline": inline, "general": general}
+        with open("/tmp/dc-inline-comments.json", "w") as f:
+            json.dump(output, f)
+
+        print(f"Parsed {len(inline)} inline + {len(general)} general findings")
+        PARSE_SCRIPT
+
+        if [ ! -f /tmp/dc-inline-comments.json ]; then
+          echo "::notice::No inline comments to post (PyYAML missing or no findings)"
+          exit 0
+        fi
+
+        # Post as a GitHub review with inline comments
+        INLINE_COUNT=$(python3 -c "import json; d=json.load(open('/tmp/dc-inline-comments.json')); print(len(d['inline']))")
+        GENERAL_COUNT=$(python3 -c "import json; d=json.load(open('/tmp/dc-inline-comments.json')); print(len(d['general']))")
+
+        if [ "$INLINE_COUNT" -eq 0 ] && [ "$GENERAL_COUNT" -eq 0 ]; then
+          echo "::notice::No findings met severity threshold"
+          exit 0
+        fi
+
+        # Build review body (general findings that couldn't be mapped to lines)
+        REVIEW_BODY=""
+        if [ "$GENERAL_COUNT" -gt 0 ]; then
+          REVIEW_BODY=$(python3 -c "
+        import json
+        d = json.load(open('/tmp/dc-inline-comments.json'))
+        parts = ['## General Findings\n']
+        for c in d['general']:
+            parts.append(c['body'] + '\n')
+        print('\n'.join(parts))
+        ")
+        fi
+
+        # Determine review event
+        EVENT="COMMENT"
+        if [ "$VERDICT" = "BLOCK" ]; then
+          EVENT="REQUEST_CHANGES"
+        fi
+
+        # Build the review payload
+        python3 - "$COMMIT_SHA" "$EVENT" "$REVIEW_BODY" << 'BUILD_REVIEW'
+        import json, sys
+
+        commit_sha = sys.argv[1]
+        event = sys.argv[2]
+        body = sys.argv[3] if len(sys.argv) > 3 else ""
+
+        data = json.load(open("/tmp/dc-inline-comments.json"))
+
+        review = {
+            "commit_id": commit_sha,
+            "event": event,
+            "body": body or "Devils Council adversarial review complete.",
+            "comments": []
+        }
+
+        for c in data["inline"]:
+            review["comments"].append({
+                "path": c["path"],
+                "line": c["line"],
+                "body": c["body"]
+            })
+
+        with open("/tmp/dc-review-payload.json", "w") as f:
+            json.dump(review, f)
+
+        print(f"Review payload: {event}, {len(review['comments'])} inline comments")
+        BUILD_REVIEW
+
+        # Post the review
+        gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+          --input /tmp/dc-review-payload.json \
+          || echo "::warning::Failed to post inline review (token may lack pull-requests:write)"
+
+    - name: Post PR summary comment
+      if: |
+        github.event_name == 'pull_request' &&
+        steps.review.outputs.synthesis_path != '' &&
+        (inputs.post-as == 'comment' || inputs.post-as == 'both')
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SYNTHESIS: ${{ steps.review.outputs.synthesis_path }}
+        BLOCKERS: ${{ steps.review.outputs.blocker_count }}
+        MAJORS: ${{ steps.review.outputs.major_count }}
+        VERDICT: ${{ steps.review.outputs.verdict }}
+      run: |
+        set -euo pipefail
+
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+
+        ICON="PASS"
+        if [ "$VERDICT" = "BLOCK" ]; then
+          ICON="BLOCK"
+        elif [ "$VERDICT" = "WARN" ]; then
+          ICON="WARN"
         fi
 
         {
-          echo "## ${ICON} Devils Council Review"
+          echo "## Devils Council Review: ${ICON}"
           echo ""
           echo "| Severity | Count |"
           echo "|----------|-------|"
           echo "| Blockers | $BLOCKERS |"
-          echo "| High | $HIGHS |"
+          echo "| Major | $MAJORS |"
           echo ""
           echo "<details>"
           echo "<summary>Full Synthesis (click to expand)</summary>"
           echo ""
-          # Truncate to keep comment readable
           head -100 "$SYNTHESIS"
           echo ""
           echo "</details>"
           echo ""
           echo "---"
-          echo "*Reviewed by [Devils Council](https://github.com/astrowicked/devils-council) — adversarial AI plan review*"
+          echo "*Reviewed by [Devils Council](https://github.com/astrowicked/devils-council) — adversarial AI review*"
         } > /tmp/dc-comment.md
 
-        # Post or update comment
         EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
           --jq '.[] | select(.body | contains("Devils Council Review")) | .id' | head -1 || true)
 
